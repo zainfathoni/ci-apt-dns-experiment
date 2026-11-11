@@ -143,7 +143,7 @@ jobs:
           cp /etc/resolv.conf "$RUNNER_TEMP/resolv-before"
           cp /run/systemd/resolve/resolv.conf "$RUNNER_TEMP/resolv-upstream"
           grep '^nameserver ' "$RUNNER_TEMP/resolv-upstream"
-          getent ahostsv4 archive.ubuntu.com
+          getent ahostsv4 archive.ubuntu.com || echo 'Official archive DNS is unavailable before injection.'
           cp /etc/apt/sources.list "$RUNNER_TEMP/sources-before"
           cat > "$RUNNER_TEMP/dns-proxy.py" <<'PY'
           import socket, socketserver, sys
@@ -196,7 +196,11 @@ jobs:
               print('Forced Azure DNS failure confirmed:', error)
           else:
               raise SystemExit('Azure hostname unexpectedly resolved')
-          print('Official archive resolves:', sorted({item[4][0] for item in socket.getaddrinfo('archive.ubuntu.com', 443)}))
+          print('GitHub resolves through DNS proxy:', sorted({item[4][0] for item in socket.getaddrinfo('github.com', 443)}))
+          try:
+              print('Official archive resolves:', sorted({item[4][0] for item in socket.getaddrinfo('archive.ubuntu.com', 443)}))
+          except socket.gaierror as error:
+              print('Official archive DNS unavailable before APT:', error)
           PY
           # Make the first APT attempt use the blocked hostname without a mirror-list escape.
           printf '%s\n' \
