@@ -1,0 +1,257 @@
+name: APT DNS fallback experiment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  original:
+    name: Original package step
+    runs-on: ubuntu-22.04
+    timeout-minutes: 18
+    steps:
+      - name: Record runner and package sources
+        run: |
+          printf 'ImageOS=%s\nImageVersion=%s\nRUNNER_OS=%s\nRUNNER_ARCH=%s\n' "$ImageOS" "$ImageVersion" "$RUNNER_OS" "$RUNNER_ARCH"
+          cat /etc/os-release
+          cat /etc/apt/sources.list
+          cat /etc/apt/apt-mirrors.txt
+          cat /etc/resolv.conf
+          curl --silent --show-error --noproxy '*' --connect-timeout 2 --max-time 5 \
+            -H Metadata:true 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01' \
+            -o "$RUNNER_TEMP/compute.json" || true
+          python3 - <<'PY'
+          import json, os
+          try:
+              with open(os.environ['RUNNER_TEMP'] + '/compute.json') as f:
+                  data = json.load(f)
+              print('Azure metadata:', {key: data.get(key) for key in ('location', 'azEnvironment', 'vmSize')})
+          except (OSError, ValueError) as error:
+              print('Azure compute metadata not available:', type(error).__name__)
+          PY
+
+      - name: Install system packages
+        run: |
+          # Install wkhtmltopdf
+          curl -sL https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.$(lsb_release -cs)_amd64.deb >> ./wkhtmltopdf.deb
+          sudo dpkg -i ./wkhtmltopdf.deb || :
+          sudo apt install --fix-broken -y
+          rm ./wkhtmltopdf.deb
+
+      - name: Verify installed package and PDF output
+        run: |
+          wkhtmltopdf --version
+          dpkg-query -W -f='${Package} ${Version} ${Status}\n' wkhtmltox xfonts-75dpi xfonts-base xfonts-utils xfonts-encodings
+          printf '<html><body><p>Package installation experiment</p></body></html>\n' > "$RUNNER_TEMP/input.html"
+          wkhtmltopdf --quiet "$RUNNER_TEMP/input.html" "$RUNNER_TEMP/output.pdf"
+          test "$(head -c 5 "$RUNNER_TEMP/output.pdf")" = '%PDF-'
+          stat --printf='PDF output: %s bytes\n' "$RUNNER_TEMP/output.pdf"
+
+  fallback-normal:
+    name: Fallback package step - normal path
+    runs-on: ubuntu-22.04
+    timeout-minutes: 18
+    steps:
+      - name: Record runner and package sources
+        run: |
+          printf 'ImageOS=%s\nImageVersion=%s\nRUNNER_OS=%s\nRUNNER_ARCH=%s\n' "$ImageOS" "$ImageVersion" "$RUNNER_OS" "$RUNNER_ARCH"
+          cat /etc/os-release
+          cat /etc/apt/sources.list
+          cat /etc/apt/apt-mirrors.txt
+          cat /etc/resolv.conf
+          cp /etc/apt/sources.list "$RUNNER_TEMP/sources-before"
+          curl --silent --show-error --noproxy '*' --connect-timeout 2 --max-time 5 \
+            -H Metadata:true 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01' \
+            -o "$RUNNER_TEMP/compute.json" || true
+          python3 - <<'PY'
+          import json, os
+          try:
+              with open(os.environ['RUNNER_TEMP'] + '/compute.json') as f:
+                  data = json.load(f)
+              print('Azure metadata:', {key: data.get(key) for key in ('location', 'azEnvironment', 'vmSize')})
+          except (OSError, ValueError) as error:
+              print('Azure compute metadata not available:', type(error).__name__)
+          PY
+
+      - name: Install system packages
+        timeout-minutes: 12
+        run: |
+          trap 'rm -f ./wkhtmltopdf.deb' EXIT
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors --retry-max-time 180 \
+            --connect-timeout 10 --max-time 120 \
+            --output ./wkhtmltopdf.deb \
+            "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.$(lsb_release -cs)_amd64.deb"
+
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+          install_wkhtmltopdf() {
+            sudo timeout 120s apt-get "${apt_options[@]}" update --error-on=any &&
+              sudo timeout 120s apt-get "${apt_options[@]}" install -y ./wkhtmltopdf.deb
+          }
+
+          if ! install_wkhtmltopdf; then
+            echo "::warning::APT failed; retry with the official Ubuntu archive instead of the Azure mirror."
+            # Ubuntu 22.04 runners use sources.list and an APT mirror list.
+            sudo sed -i \
+              -e 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu/|g' \
+              -e 's|http://azure\.archive\.ubuntu\.com/ubuntu/|https://archive.ubuntu.com/ubuntu/|g' \
+              /etc/apt/sources.list
+            install_wkhtmltopdf
+          fi
+          wkhtmltopdf --version
+
+      - name: Verify normal path and PDF output
+        run: |
+          cmp "$RUNNER_TEMP/sources-before" /etc/apt/sources.list
+          echo 'Normal path confirmed: Ubuntu sources are unchanged.'
+          test ! -e ./wkhtmltopdf.deb
+          dpkg-query -W -f='${Package} ${Version} ${Status}\n' wkhtmltox xfonts-75dpi xfonts-base xfonts-utils xfonts-encodings
+          printf '<html><body><p>Package installation experiment</p></body></html>\n' > "$RUNNER_TEMP/input.html"
+          wkhtmltopdf --quiet "$RUNNER_TEMP/input.html" "$RUNNER_TEMP/output.pdf"
+          test "$(head -c 5 "$RUNNER_TEMP/output.pdf")" = '%PDF-'
+          stat --printf='PDF output: %s bytes\n' "$RUNNER_TEMP/output.pdf"
+
+  fallback-forced-dns:
+    name: Fallback package step - forced Azure DNS failure
+    runs-on: ubuntu-22.04
+    timeout-minutes: 18
+    steps:
+      - name: Record runner and package sources
+        run: |
+          printf 'ImageOS=%s\nImageVersion=%s\nRUNNER_OS=%s\nRUNNER_ARCH=%s\n' "$ImageOS" "$ImageVersion" "$RUNNER_OS" "$RUNNER_ARCH"
+          cat /etc/os-release
+          cat /etc/apt/sources.list
+          cat /etc/apt/apt-mirrors.txt
+          cat /etc/resolv.conf
+          curl --silent --show-error --noproxy '*' --connect-timeout 2 --max-time 5 \
+            -H Metadata:true 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01' \
+            -o "$RUNNER_TEMP/compute.json" || true
+          python3 - <<'PY'
+          import json, os
+          try:
+              with open(os.environ['RUNNER_TEMP'] + '/compute.json') as f:
+                  data = json.load(f)
+              print('Azure metadata:', {key: data.get(key) for key in ('location', 'azEnvironment', 'vmSize')})
+          except (OSError, ValueError) as error:
+              print('Azure compute metadata not available:', type(error).__name__)
+          PY
+
+      - name: Force Azure-only DNS failure
+        run: |
+          cp /etc/resolv.conf "$RUNNER_TEMP/resolv-before"
+          cp /etc/apt/sources.list "$RUNNER_TEMP/sources-before"
+          cat > "$RUNNER_TEMP/dns-proxy.py" <<'PY'
+          import socket, socketserver, sys
+
+          upstreams = [line.split()[1] for line in open(sys.argv[1]) if line.startswith('nameserver ')]
+
+          class DNS(socketserver.BaseRequestHandler):
+              def handle(self):
+                  packet, server = self.request
+                  offset, labels = 12, []
+                  while packet[offset]:
+                      length = packet[offset]
+                      labels.append(packet[offset + 1:offset + 1 + length].decode('ascii'))
+                      offset += 1 + length
+                  hostname = '.'.join(labels).lower()
+                  if hostname == 'azure.archive.ubuntu.com':
+                      print('DNS_BLOCKED: azure.archive.ubuntu.com -> SERVFAIL', flush=True)
+                      response = packet[:2] + b'\x81\x82' + packet[4:6] + b'\x00' * 6 + packet[12:offset + 5]
+                      server.sendto(response, self.client_address)
+                      return
+                  for upstream in upstreams:
+                      try:
+                          with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as relay:
+                              relay.settimeout(3)
+                              relay.sendto(packet, (upstream, 53))
+                              response = relay.recv(65535)
+                          server.sendto(response, self.client_address)
+                          return
+                      except OSError:
+                          continue
+
+          with socketserver.ThreadingUDPServer(('127.0.0.1', 53), DNS) as server:
+              print('DNS proxy ready', flush=True)
+              server.serve_forever()
+          PY
+          sudo python3 -u "$RUNNER_TEMP/dns-proxy.py" "$RUNNER_TEMP/resolv-before" > "$RUNNER_TEMP/dns-proxy.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/dns-proxy.pid"
+          for attempt in {1..20}; do
+            if grep -q 'DNS proxy ready' "$RUNNER_TEMP/dns-proxy.log"; then break; fi
+            sleep 0.1
+          done
+          grep -q 'DNS proxy ready' "$RUNNER_TEMP/dns-proxy.log"
+          printf 'nameserver 127.0.0.1\noptions timeout:2 attempts:1\n' | sudo tee /etc/resolv.conf
+          python3 - <<'PY'
+          import socket
+          try:
+              socket.getaddrinfo('azure.archive.ubuntu.com', 80)
+          except socket.gaierror as error:
+              assert error.errno == socket.EAI_AGAIN, error
+              print('Forced Azure DNS failure confirmed:', error)
+          else:
+              raise SystemExit('Azure hostname unexpectedly resolved')
+          print('Official archive resolves:', sorted({item[4][0] for item in socket.getaddrinfo('archive.ubuntu.com', 443)}))
+          PY
+          # Make the first APT attempt use the blocked hostname without a mirror-list escape.
+          printf '%s\n' \
+            'deb http://azure.archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse' \
+            'deb http://azure.archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse' \
+            'deb http://azure.archive.ubuntu.com/ubuntu/ jammy-backports main restricted universe multiverse' \
+            'deb http://azure.archive.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse' \
+            | sudo tee /etc/apt/sources.list
+
+      - name: Install system packages
+        timeout-minutes: 12
+        run: |
+          trap 'rm -f ./wkhtmltopdf.deb' EXIT
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors --retry-max-time 180 \
+            --connect-timeout 10 --max-time 120 \
+            --output ./wkhtmltopdf.deb \
+            "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.$(lsb_release -cs)_amd64.deb"
+
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+          install_wkhtmltopdf() {
+            sudo timeout 120s apt-get "${apt_options[@]}" update --error-on=any &&
+              sudo timeout 120s apt-get "${apt_options[@]}" install -y ./wkhtmltopdf.deb
+          }
+
+          if ! install_wkhtmltopdf; then
+            echo "::warning::APT failed; retry with the official Ubuntu archive instead of the Azure mirror."
+            # Ubuntu 22.04 runners use sources.list and an APT mirror list.
+            sudo sed -i \
+              -e 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu/|g' \
+              -e 's|http://azure\.archive\.ubuntu\.com/ubuntu/|https://archive.ubuntu.com/ubuntu/|g' \
+              /etc/apt/sources.list
+            install_wkhtmltopdf
+          fi
+          wkhtmltopdf --version
+
+      - name: Verify official archive recovery and PDF output
+        run: |
+          grep -q '^deb https://archive.ubuntu.com/ubuntu/' /etc/apt/sources.list
+          if grep -q 'azure.archive.ubuntu.com' /etc/apt/sources.list; then exit 1; fi
+          grep 'DNS_BLOCKED:' "$RUNNER_TEMP/dns-proxy.log"
+          test ! -e ./wkhtmltopdf.deb
+          dpkg-query -W -f='${Package} ${Version} ${Status}\n' wkhtmltox xfonts-75dpi xfonts-base xfonts-utils xfonts-encodings
+          printf '<html><body><p>Package installation experiment</p></body></html>\n' > "$RUNNER_TEMP/input.html"
+          wkhtmltopdf --quiet "$RUNNER_TEMP/input.html" "$RUNNER_TEMP/output.pdf"
+          test "$(head -c 5 "$RUNNER_TEMP/output.pdf")" = '%PDF-'
+          stat --printf='PDF output: %s bytes\n' "$RUNNER_TEMP/output.pdf"
+
+      - name: Restore runner DNS and sources
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/resolv-before"; then
+            sudo cp "$RUNNER_TEMP/resolv-before" /etc/resolv.conf
+          fi
+          if test -f "$RUNNER_TEMP/sources-before"; then
+            sudo cp "$RUNNER_TEMP/sources-before" /etc/apt/sources.list
+          fi
+          if test -f "$RUNNER_TEMP/dns-proxy.pid"; then
+            sudo kill "$(cat "$RUNNER_TEMP/dns-proxy.pid")" || true
+            cat "$RUNNER_TEMP/dns-proxy.log"
+          fi
