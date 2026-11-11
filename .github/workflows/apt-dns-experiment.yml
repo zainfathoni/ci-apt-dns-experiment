@@ -141,6 +141,9 @@ jobs:
       - name: Force Azure-only DNS failure
         run: |
           cp /etc/resolv.conf "$RUNNER_TEMP/resolv-before"
+          cp /run/systemd/resolve/resolv.conf "$RUNNER_TEMP/resolv-upstream"
+          grep '^nameserver ' "$RUNNER_TEMP/resolv-upstream"
+          getent ahostsv4 archive.ubuntu.com
           cp /etc/apt/sources.list "$RUNNER_TEMP/sources-before"
           cat > "$RUNNER_TEMP/dns-proxy.py" <<'PY'
           import socket, socketserver, sys
@@ -176,7 +179,7 @@ jobs:
               print('DNS proxy ready', flush=True)
               server.serve_forever()
           PY
-          sudo python3 -u "$RUNNER_TEMP/dns-proxy.py" "$RUNNER_TEMP/resolv-before" > "$RUNNER_TEMP/dns-proxy.log" 2>&1 &
+          sudo python3 -u "$RUNNER_TEMP/dns-proxy.py" "$RUNNER_TEMP/resolv-upstream" > "$RUNNER_TEMP/dns-proxy.log" 2>&1 &
           echo "$!" > "$RUNNER_TEMP/dns-proxy.pid"
           for attempt in {1..20}; do
             if grep -q 'DNS proxy ready' "$RUNNER_TEMP/dns-proxy.log"; then break; fi
